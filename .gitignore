@@ -1,0 +1,6 @@
+.env
+privateKey.pem
+__pycache__/
+*.egg-info/
+dist/
+build/
