@@ -1,6 +1,6 @@
 # cdata-connect-ai-embed
 
-Python SDK for CData Connect AI Embed — authenticate, manage connections, query data, and run AI agents against your connected data sources.
+Python SDK for CData Connect AI Embed — authenticate, manage connections, query data, and run AI agents against your connected data sources. Contact sales@cdata.com if you are interested in starting a free trial account.  Documentation: https://docs.cloud.cdata.com/en/Quick-Start-Embedded 
 
 ## Installation
 
