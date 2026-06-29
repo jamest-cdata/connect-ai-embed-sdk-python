@@ -40,12 +40,17 @@ def prompt(msg: str, default: str = "") -> str:
     return val or default
 
 
-def prompt_choice(msg: str, options: list[str], allow_zero_exit: bool = True) -> int | None:
+def prompt_choice(
+    msg: str,
+    options: list[str],
+    allow_zero_exit: bool = True,
+    zero_label: str = "↩ Back to sub-account selection",
+) -> int | None:
     print(f"\n{msg}")
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
     if allow_zero_exit:
-        print(f"  0) Exit")
+        print(f"  0) {zero_label}")
     while True:
         raw = input("Selection: ").strip()
         if not raw:
@@ -59,7 +64,30 @@ def prompt_choice(msg: str, options: list[str], allow_zero_exit: bool = True) ->
             return None
         if 1 <= choice <= len(options):
             return choice
-        print(f"  Choose 1–{len(options)}" + (" or 0 to exit." if allow_zero_exit else "."))
+        print(f"  Choose 1–{len(options)}" + (f" or 0." if allow_zero_exit else "."))
+
+
+def _prompt_name_or_default(
+    label: str, default: str, existing: set[str], clash_label: str
+) -> str | None:
+    """Let user accept auto-generated default or enter a custom name."""
+    choice = prompt_choice(f"{label}: '{default}'", [
+        f"Use '{default}'",
+        "Enter a custom name",
+    ], allow_zero_exit=True)
+    if choice is None:
+        return None
+    if choice == 1:
+        return default
+    while True:
+        val = input(f"  Enter {label}: ").strip()
+        if not val:
+            print(f"  {clash_label} cannot be empty.")
+            continue
+        if val.lower() in existing:
+            print(f"  {clash_label} '{val}' already exists. Choose a different name.")
+            continue
+        return val
 
 
 # ── Steps ─────────────────────────────────────────────────────────────────────
@@ -78,12 +106,14 @@ async def step_select_subaccount(client: ConnectAIEmbedClient) -> str | None:
         options = []
         for a in accounts:
             ext_id = a.get("externalID") or a.get("externalId") or "—"
+            acct_name = a.get("accountName") or a.get("name") or ""
             acct_id = a.get("id") or a.get("accountId") or "—"
-            label = f"{ext_id}  (ID: {acct_id})"
+            name_part = f" — {acct_name}" if acct_name else ""
+            label = f"{ext_id}{name_part}  (ID: {acct_id})"
             options.append(label)
         options.append("Create a new sub-account")
 
-        choice = prompt_choice("Select a sub-account or create new:", options)
+        choice = prompt_choice("Select a sub-account or create new:", options, zero_label="Exit")
         if choice is None:
             return None
         if choice <= len(accounts):
@@ -95,19 +125,44 @@ async def step_select_subaccount(client: ConnectAIEmbedClient) -> str | None:
     else:
         print("  No existing sub-accounts found.")
 
-    # Create new
-    uid = uuid.uuid4().hex[:8]
-    default_name = f"quickstart-{uid}"
-    ext_id = prompt(f"\nExternal ID for new sub-account", default_name)
+    # Collect existing names to prevent clashes
+    existing_ext_ids = {
+        (a.get("externalID") or a.get("externalId") or "").lower()
+        for a in accounts
+    }
+    existing_acct_names = {
+        (a.get("accountName") or a.get("name") or "").lower()
+        for a in accounts
+    }
 
-    print(f"  Creating sub-account '{ext_id}'...")
-    account = await client.accounts.create(external_id=ext_id)
+    # Generate unique defaults that don't clash
+    uid = uuid.uuid4().hex[:8]
+    default_ext_id = f"quickstart-{uid}"
+    default_acct_name = f"Quickstart {uid}"
+
+    # External ID
+    ext_id = _prompt_name_or_default(
+        "External ID", default_ext_id, existing_ext_ids, "External ID"
+    )
+    if ext_id is None:
+        return None
+
+    # Account Name
+    acct_name = _prompt_name_or_default(
+        "Account Name", default_acct_name, existing_acct_names, "Account Name"
+    )
+    if acct_name is None:
+        return None
+
+    print(f"\n  Creating sub-account '{acct_name}' (ext: {ext_id})...")
+    account = await client.accounts.create(external_id=ext_id, account_name=acct_name)
     sub_id = account.get("id") or account.get("accountId")
     print(f"  Created! Sub-Account ID: {sub_id}")
     return sub_id
 
 
-async def step_select_connection(client: ConnectAIEmbedClient, sub_id: str) -> dict | None:
+async def step_select_connection(client: ConnectAIEmbedClient, sub_id: str) -> dict | str | None:
+    """Returns connection dict, 'change_subaccount', or None to exit."""
     print("\n" + "=" * 60)
     print("STEP 2: Connection")
     print("=" * 60)
@@ -281,7 +336,7 @@ async def step_chat_agent(client: ConnectAIEmbedClient, sub_id: str, provider: s
 
     while True:
         options = list(_SAMPLE_PROMPTS) + ["Enter my own prompt"]
-        choice = prompt_choice("Select a prompt or write your own:", options)
+        choice = prompt_choice("Select a prompt or write your own:", options, zero_label="End chat session")
         if choice is None:
             break
 
@@ -365,9 +420,8 @@ async def step_query_data(
                 "Query another table",
                 "Change schema / catalog",
                 "Change connection",
-                "Done",
             ])
-            if action is None or action == 4:
+            if action is None:
                 return None
             if action == 3:
                 return "retry_connection"
@@ -543,78 +597,81 @@ async def main():
         private_key=key_path.read_text(),
     ))
 
-    # Step 1: Sub-account
-    sub_id = await step_select_subaccount(client)
-    if not sub_id:
-        print("\nExiting.")
-        return
-
-    # Check if chat agent is available (connections exist + LLM env set)
-    llm_provider = _detect_llm_provider()
-    has_connections = False
-    if llm_provider:
-        try:
-            conns = await client.connections.list_connections(sub_id)
-            has_connections = len(conns) > 0
-        except Exception:
-            pass
-
-    if has_connections and llm_provider:
-        mode = prompt_choice("What would you like to do?", [
-            "Query data (metadata → tables → SQL)",
-            "Use CData MCP (AI chat agent)",
-            "Both — query first, then chat",
-        ])
-        if mode is None:
+    while True:  # outer loop: sub-account selection
+        # Step 1: Sub-account
+        sub_id = await step_select_subaccount(client)
+        if not sub_id:
             print("\nExiting.")
             return
 
-        if mode == 2:
-            await step_chat_agent(client, sub_id, llm_provider)
-            print("\n" + "=" * 60)
-            print("Quick Start complete!")
-            print("=" * 60)
-            return
+        restart = await _run_mode_loop(client, sub_id)
+        if not restart:
+            break
 
-        if mode == 3:
-            # Query first, then chat
-            while True:
-                connection = await step_select_connection(client, sub_id)
-                if not connection:
-                    break
-                result = await step_query_data(client, sub_id, connection)
-                if result == "retry_connection":
-                    print("\n  Returning to connection selection...")
+    print("\n" + "=" * 60)
+    print("Quick Start complete!")
+    print("=" * 60)
+
+
+async def _run_mode_loop(client: ConnectAIEmbedClient, sub_id: str) -> bool:
+    """Run the mode selection → query/chat loop. Returns True to restart sub-account selection."""
+    while True:  # mode selection loop
+        llm_provider = _detect_llm_provider()
+        has_connections = False
+        if llm_provider:
+            try:
+                conns = await client.connections.list_connections(sub_id)
+                has_connections = len(conns) > 0
+            except Exception:
+                pass
+
+        if has_connections and llm_provider:
+            mode = prompt_choice("What would you like to do?", [
+                "Query data (metadata → tables → SQL)",
+                "Use CData MCP (AI chat agent)",
+                "Both — query first, then chat",
+            ])
+            if mode is None:
+                return True  # back to sub-account selection
+
+            if mode == 2:
+                await step_chat_agent(client, sub_id, llm_provider)
+                continue  # back to mode selection
+
+            if mode in (1, 3):
+                result = await _run_query_loop(client, sub_id)
+                if result == "change_subaccount":
+                    return True
+                if mode == 3:
+                    await step_chat_agent(client, sub_id, llm_provider)
+                continue  # back to mode selection
+        else:
+            result = await _run_query_loop(client, sub_id)
+            if result == "change_subaccount":
+                return True
+
+            if llm_provider:
+                try_chat = prompt("\n  Try the AI chat agent? (y/n)", "n")
+                if try_chat.lower() == "y":
+                    await step_chat_agent(client, sub_id, llm_provider)
                     continue
-                break
-            await step_chat_agent(client, sub_id, llm_provider)
-            print("\n" + "=" * 60)
-            print("Quick Start complete!")
-            print("=" * 60)
-            return
+            return True  # back to sub-account selection
 
-    # Default: Step 2 & 3 loop (query data)
+
+async def _run_query_loop(client: ConnectAIEmbedClient, sub_id: str) -> str:
+    """Run connection → query loop. Returns 'change_subaccount' or 'reselect_mode'."""
     while True:
         connection = await step_select_connection(client, sub_id)
-        if not connection:
-            print("\nExiting.")
-            return
+        if connection == "change_subaccount" or not connection:
+            return "change_subaccount"
 
         result = await step_query_data(client, sub_id, connection)
         if result == "retry_connection":
             print("\n  Returning to connection selection...")
             continue
-        break
-
-    # Offer chat agent at the end if LLM is available
-    if llm_provider:
-        try_chat = prompt("\n  Try the AI chat agent? (y/n)", "n")
-        if try_chat.lower() == "y":
-            await step_chat_agent(client, sub_id, llm_provider)
-
-    print("\n" + "=" * 60)
-    print("Quick Start complete!")
-    print("=" * 60)
+        if result == "change_subaccount":
+            return "change_subaccount"
+        return "reselect_mode"
 
 
 if __name__ == "__main__":
